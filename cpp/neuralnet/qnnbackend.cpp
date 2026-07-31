@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -61,8 +62,14 @@ static unique_ptr<Ort::Env> g_ortEnv;
 
 static Ort::Env& getOrtEnv() {
   std::lock_guard<std::mutex> lock(g_ortEnvMutex);
-  if(g_ortEnv == nullptr)
-    g_ortEnv = make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "katago-qnn");
+  if(g_ortEnv == nullptr) {
+    // Env log level defaults to WARNING; KATAGO_QNN_ORT_LOG=0..4 (VERBOSE..FATAL) can raise it so the
+    // QNN EP's graph-partition summary (HTP-vs-CPU node counts) is visible for op-coverage audits.
+    OrtLoggingLevel level = ORT_LOGGING_LEVEL_WARNING;
+    if(const char* env = std::getenv("KATAGO_QNN_ORT_LOG"))
+      level = (OrtLoggingLevel)std::atoi(env);
+    g_ortEnv = make_unique<Ort::Env>(level, "katago-qnn");
+  }
   return *g_ortEnv;
 }
 
@@ -123,6 +130,8 @@ struct ComputeContext {
   int vtcmMb;                    // optional HTP VTCM size hint (0 => leave to the EP default)
   bool transformerNHWC;          // ONNX emitter layout (default false => NCHW for the HTP)
   string batchBucketsSpec;       // qnnBatchBuckets: comma-separated static-N buckets ("" => default)
+  bool disableCpuEpFallback;     // qnnDisableCpuEpFallback: make unsupported nodes a hard error (audit)
+  bool verbose;                  // qnnVerbose: session log level VERBOSE (shows QNN HTP/CPU partition)
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -154,6 +163,10 @@ ComputeContext* NeuralNet::createComputeContext(
   context->transformerNHWC = cfg.contains("qnnTransformerNHWC") ? cfg.getBool("qnnTransformerNHWC") : false;
   // Optional explicit static-batch bucket set (parsed per-handle since it depends on maxBatchSize).
   context->batchBucketsSpec = cfg.contains("qnnBatchBuckets") ? cfg.getString("qnnBatchBuckets") : "";
+  // Diagnostics (design doc 8 op-coverage audit): fail hard on any node the HTP can't take, and/or
+  // raise the session log level so ORT logs the QNN HTP-vs-CPU node partition.
+  context->disableCpuEpFallback = cfg.contains("qnnDisableCpuEpFallback") ? cfg.getBool("qnnDisableCpuEpFallback") : false;
+  context->verbose = cfg.contains("qnnVerbose") ? cfg.getBool("qnnVerbose") : false;
   return context;
 }
 
@@ -334,6 +347,9 @@ struct ComputeHandle {
   // for a (nonexistent) external context binary. Either way, for the HTP device we append the QNN EP.
   void configureSessionOptions(Ort::SessionOptions& so, bool forCompile, int staticN) const {
     so.SetIntraOpNumThreads(1);
+    // Raise the session log level so ORT/QNN logs the graph partition (nodes on the HTP vs CPU EP).
+    if(ctx->verbose)
+      so.SetLogSeverityLevel(0);
     so.SetGraphOptimizationLevel(
       forCompile ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_DISABLE_ALL);
 
@@ -344,6 +360,10 @@ struct ComputeHandle {
       so.AddFreeDimensionOverrideByName("batch", (int64_t)staticN);
 
     if(deviceIsHtp(qnnDevice)) {
+      // Audit mode: any node the HTP can't take becomes a hard error (naming the op) instead of being
+      // silently partitioned onto the CPU EP. Fails at graph partition, before the slow HTP compile.
+      if(ctx->disableCpuEpFallback)
+        so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
       unordered_map<string, string> qnnOptions;
       qnnOptions["backend_path"] = ctx->qnnBackendPath.empty() ? string("QnnHtp.dll") : ctx->qnnBackendPath;
       qnnOptions["htp_performance_mode"] = ctx->htpPerformanceMode;
