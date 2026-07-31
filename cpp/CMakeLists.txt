@@ -44,7 +44,7 @@ endif()
 set(BUILD_DISTRIBUTED 0 CACHE BOOL "Build with http support for contributing to distributed training")
 set(USE_BACKEND CACHE STRING "Neural net backend")
 string(TOUPPER "${USE_BACKEND}" USE_BACKEND)
-set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL)
+set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL QNN)
 
 set(USE_TCMALLOC 0 CACHE BOOL "Use TCMalloc")
 set(NO_GIT_REVISION 0 CACHE BOOL "Disable embedding the git revision into the compiled exe")
@@ -163,6 +163,11 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
   endif()
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/eigenbackend.cpp
+    )
+elseif(USE_BACKEND STREQUAL "QNN")
+  message(STATUS "-DUSE_BACKEND=QNN, using ONNX Runtime + Qualcomm QNN (Hexagon HTP) backend.")
+  set(NEURALNET_BACKEND_SOURCES
+    neuralnet/qnnbackend.cpp
     )
 elseif(USE_BACKEND STREQUAL "")
   message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN to compile with the respective backend.${ColorReset}")
@@ -370,6 +375,26 @@ add_executable(katago
   main.cpp
   )
 
+# Compile the vendored ONNX schema (cpp/external/onnx/onnx.proto) plus the ONNX emitter, and link
+# our own protobuf, for backends that consume the emitter. The TENSORRT backend hands the emitted
+# serialized bytes to nvonnxparser; the QNN backend hands them to ONNX Runtime. Factored out here so
+# both backends share exactly one copy of the proto-compile + emitter wiring.
+function(katago_enable_onnx_emitter target)
+  find_package(Protobuf REQUIRED)
+  message(STATUS "Found Protobuf version: ${Protobuf_VERSION}")
+  set(ONNX_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/onnx")
+  protobuf_generate_cpp(ONNX_PROTO_SRCS ONNX_PROTO_HDRS "${ONNX_PROTO_DIR}/onnx.proto")
+  # protoc-generated code is not ours to lint; silence its warnings to keep build output readable.
+  set_source_files_properties(${ONNX_PROTO_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
+  target_sources(${target} PRIVATE ${ONNX_PROTO_SRCS} neuralnet/onnxmodelbuilder.cpp)
+  # Generated onnx.pb.h lands in the build dir; let backend code include it.
+  target_include_directories(${target} SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
+  # Link the imported target rather than ${Protobuf_LIBRARIES}: when protobuf comes from a
+  # CMake package config (e.g. vcpkg), the variable can resolve to the DLL itself rather
+  # than the import lib, and it also omits protobuf's own dependencies such as abseil.
+  target_link_libraries(${target} protobuf::libprotobuf)
+endfunction()
+
 if(USE_BACKEND STREQUAL "CUDA")
   target_compile_definitions(katago PRIVATE USE_CUDA_BACKEND)
   target_compile_definitions(katago PRIVATE CUDA_TARGET_VERSION=${CMAKE_CUDA_COMPILER_VERSION})
@@ -450,19 +475,10 @@ elseif(USE_BACKEND STREQUAL "TENSORRT")
   target_link_libraries(katago CUDA::cudart_static ${TENSORRT_LIBRARY})
 
   # The TensorRT backend builds networks by emitting an ONNX ModelProto and handing the
-  # serialized bytes to TensorRT's nvonnxparser. We compile the vendored ONNX schema
-  # (cpp/external/onnx/onnx.proto) with protoc and link against our own protobuf; this is
-  # symbol-isolated from the protobuf that TensorRT statically links into nvonnxparser, so
-  # there is no ABI contact between the two (the handoff is serialized bytes).
-  find_package(Protobuf REQUIRED)
-  message(STATUS "Found Protobuf version: ${Protobuf_VERSION}")
-  set(ONNX_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/onnx")
-  protobuf_generate_cpp(ONNX_PROTO_SRCS ONNX_PROTO_HDRS "${ONNX_PROTO_DIR}/onnx.proto")
-  # protoc-generated code is not ours to lint; silence its warnings to keep build output readable.
-  set_source_files_properties(${ONNX_PROTO_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
-  target_sources(katago PRIVATE ${ONNX_PROTO_SRCS} neuralnet/onnxmodelbuilder.cpp)
-  # Generated onnx.pb.h lands in the build dir; let backend code include it.
-  target_include_directories(katago SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
+  # serialized bytes to TensorRT's nvonnxparser. Compile the vendored ONNX schema + emitter and
+  # link our own protobuf (symbol-isolated from the protobuf that TensorRT statically links into
+  # nvonnxparser, since the handoff is serialized bytes).
+  katago_enable_onnx_emitter(katago)
 
   # nvonnxparser ships alongside nvinfer in the TensorRT lib dir. Derive that dir from the
   # already-resolved TENSORRT_LIBRARY so this works both with TENSORRT_ROOT_DIR and with a
@@ -472,10 +488,7 @@ elseif(USE_BACKEND STREQUAL "TENSORRT")
   if(NOT TENSORRT_ONNXPARSER_LIBRARY)
     message(FATAL_ERROR "${ColorBoldRed} libnvonnxparser was NOT found in the TensorRT lib dir. ${ColorReset}")
   endif()
-  # Link the imported target rather than ${Protobuf_LIBRARIES}: when protobuf comes from a
-  # CMake package config (e.g. vcpkg), the variable can resolve to the DLL itself rather
-  # than the import lib, and it also omits protobuf's own dependencies such as abseil.
-  target_link_libraries(katago ${TENSORRT_ONNXPARSER_LIBRARY} protobuf::libprotobuf)
+  target_link_libraries(katago ${TENSORRT_ONNXPARSER_LIBRARY})
 elseif(USE_BACKEND STREQUAL "METAL")
   target_compile_definitions(katago PRIVATE USE_METAL_BACKEND)
   target_link_libraries(katago KataGoSwift katagocoreml
@@ -534,6 +547,39 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
       include_directories(SYSTEM ${EIGEN3_INCLUDE_DIRS})
       message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
     endif()
+  endif()
+elseif(USE_BACKEND STREQUAL "QNN")
+  target_compile_definitions(katago PRIVATE USE_QNN_BACKEND)
+
+  # ONNX Runtime with the QNN Execution Provider (prebuilt ARM64 package or self-built ORT).
+  # Point cmake at the unpacked ORT via -DONNXRUNTIME_ROOT_DIR=<dir> containing include/ and lib/.
+  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    HINTS ${ONNXRUNTIME_ROOT_DIR} PATH_SUFFIXES include include/onnxruntime include/onnxruntime/core/session)
+  find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+    HINTS ${ONNXRUNTIME_ROOT_DIR} PATH_SUFFIXES lib)
+  if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+    message(FATAL_ERROR "${ColorBoldRed} ONNX Runtime (with QNN EP) was NOT found; set -DONNXRUNTIME_ROOT_DIR=<dir> pointing at an unpacked ARM64 onnxruntime containing include/ and lib/. ${ColorReset}")
+  endif()
+  message(STATUS "Found ONNX Runtime include: ${ONNXRUNTIME_INCLUDE_DIR}")
+  message(STATUS "Found ONNX Runtime library: ${ONNXRUNTIME_LIBRARY}")
+  include_directories(SYSTEM ${ONNXRUNTIME_INCLUDE_DIR})
+  target_link_libraries(katago ${ONNXRUNTIME_LIBRARY})
+
+  # Shared ONNX emitter (same proto-compile + emitter the TENSORRT backend uses). ORT consumes the
+  # serialized bytes, so our vendored protobuf never crosses the ORT ABI boundary.
+  katago_enable_onnx_emitter(katago)
+
+  # The QNN EP loads QnnHtp.dll + the HTP stub/skel at runtime. Deploy the ORT + QNN runtime DLLs
+  # next to katago.exe so they are discoverable. Provide the lists via -DONNXRUNTIME_RUNTIME_DLLS
+  # (onnxruntime.dll + onnxruntime_providers_qnn.dll) and/or -DQNN_RUNTIME_DLLS (QnnHtp.dll,
+  # QnnSystem.dll, QnnHtpV73Stub.dll, libQnnHtpV73Skel.so, ...).
+  if(ONNXRUNTIME_RUNTIME_DLLS)
+    add_custom_command(TARGET katago POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ONNXRUNTIME_RUNTIME_DLLS} $<TARGET_FILE_DIR:katago>)
+  endif()
+  if(QNN_RUNTIME_DLLS)
+    add_custom_command(TARGET katago POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QNN_RUNTIME_DLLS} $<TARGET_FILE_DIR:katago>)
   endif()
 endif()
 

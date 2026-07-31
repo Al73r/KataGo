@@ -83,6 +83,15 @@ void TestCommon::overrideForBackends(bool& inputsNHWC, bool& useNHWC) {
     cout << "Backend is TensorRT, ignoring args and forcing useNHWC=false" << endl;
     useNHWC = false;
   }
+#elif defined(USE_QNN_BACKEND)
+  if(inputsNHWC != false) {
+    cout << "Backend is QNN, ignoring args and forcing inputsNHWC=false" << endl;
+    inputsNHWC = false;
+  }
+  if(useNHWC != false) {
+    cout << "Backend is QNN, ignoring args and forcing useNHWC=false" << endl;
+    useNHWC = false;
+  }
 #else
   (void)inputsNHWC;
   (void)useNHWC;
