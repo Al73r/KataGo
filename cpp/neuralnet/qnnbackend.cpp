@@ -10,12 +10,14 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -120,6 +122,7 @@ struct ComputeContext {
   string contextCacheDirOverride;
   int vtcmMb;                    // optional HTP VTCM size hint (0 => leave to the EP default)
   bool transformerNHWC;          // ONNX emitter layout (default false => NCHW for the HTP)
+  string batchBucketsSpec;       // qnnBatchBuckets: comma-separated static-N buckets ("" => default)
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -149,6 +152,8 @@ ComputeContext* NeuralNet::createComputeContext(
   context->vtcmMb = cfg.contains("qnnVtcmMb") ? cfg.getInt("qnnVtcmMb", 0, 1024) : 0;
   // The HTP's ONNX contract is NCHW. Keep this false unless someone deliberately benchmarks NHWC.
   context->transformerNHWC = cfg.contains("qnnTransformerNHWC") ? cfg.getBool("qnnTransformerNHWC") : false;
+  // Optional explicit static-batch bucket set (parsed per-handle since it depends on maxBatchSize).
+  context->batchBucketsSpec = cfg.contains("qnnBatchBuckets") ? cfg.getString("qnnBatchBuckets") : "";
   return context;
 }
 
@@ -179,16 +184,50 @@ static string sha256Hex(const string& bytes) {
   return string(hash);
 }
 
+// Compute the sorted, deduped set of static-batch bucket sizes for a handle. Each bucket is a separate
+// compiled HTP context specialized to a fixed N; getOutput dispatches each eval to the smallest bucket
+// that fits, so partial batches waste at most (nextBucket/batchSize - 1) rows instead of padding all
+// the way up to maxBatchSize. spec is the qnnBatchBuckets config ("" => default {1, 8, maxBatchSize}).
+// The result is clamped to [1, maxBatchSize], always includes maxBatchSize (so any batch fits), and is
+// sorted ascending.
+static vector<int> computeBucketSizes(int maxBatchSize, const string& spec) {
+  if(maxBatchSize < 1)
+    maxBatchSize = 1;
+  std::set<int> sizes;
+  if(Global::trim(spec).empty()) {
+    sizes.insert(1);
+    sizes.insert(8);
+  } else {
+    for(const string& tok: Global::split(spec, ',')) {
+      string t = Global::trim(tok);
+      if(t.empty())
+        continue;
+      int n = 0;
+      if(Global::tryStringToInt(t, n) && n >= 1)
+        sizes.insert(std::min(n, maxBatchSize));
+    }
+  }
+  sizes.insert(maxBatchSize);  // the largest bucket must cover the maximum batch the server can send
+  return vector<int>(sizes.begin(), sizes.end());
+}
+
 //------------------------------------------------------------------------------------------------
 // ComputeHandle
 //------------------------------------------------------------------------------------------------
 
 struct ComputeHandle {
+  // A single compiled HTP context specialized to a fixed static batch N. We hold several (buckets) and
+  // dispatch each eval to the smallest N that fits, so partial batches don't pad all the way up to
+  // maxBatchSize.
+  struct Bucket {
+    int n;
+    unique_ptr<Ort::Session> session;
+  };
+
   const ComputeContext* ctx;
 
   int modelVersion;
   int maxBatchSize;
-  int staticBatch;  // the concrete N the session was specialized to (HTP needs fully static shapes)
   bool requireExactNNLen;
   bool inputsUseNHWC;
   bool usingFP16;
@@ -206,7 +245,7 @@ struct ComputeHandle {
   size_t singleGlobalElts;
 
   Ort::MemoryInfo memInfo;
-  unique_ptr<Ort::Session> session;
+  vector<Bucket> buckets;  // ascending by n; buckets.back().n == maxBatchSize
 
   ComputeHandle(
     Logger* logger,
@@ -246,18 +285,11 @@ struct ComputeHandle {
 
     usingFP16 = resolveUseFP16(ctx->useFP16Mode, qnnDevice);
 
-    // Static batch: the HTP requires fully static shapes, so the session is specialized to a concrete
-    // N. We use N = maxBatchSize so that any batch the NN server sends (numBatchEltsFilled in
-    // [1, maxBatchSize]) fits; partial batches are padded up to N by duplicating the last valid row
-    // (never an all-zero mask, which would divide by zero in gpool/RMSNorm). This is the design's
-    // Phase-2 batching. maxBatchSize comes from nnMaxBatchSize via the framework.
-    staticBatch = maxBatchSize < 1 ? 1 : maxBatchSize;
-
     singleMaskElts = (size_t)ctx->nnXLen * ctx->nnYLen;
     singleSpatialElts = (size_t)numSpatialFeatures * ctx->nnXLen * ctx->nnYLen;
     singleGlobalElts = (size_t)numGlobalFeatures;
 
-    // Emit the FP32, NCHW ONNX graph (weights baked in) exactly as the TensorRT backend does.
+    // Emit the FP32, NCHW ONNX graph (weights baked in) once; every bucket compiles from these bytes.
     if(logger != NULL)
       logger->write(
         "QNN backend thread " + Global::intToString(serverThreadIdx) + ": emitting ONNX for model version " +
@@ -266,15 +298,29 @@ struct ComputeHandle {
       OnnxModelBuilder::build(desc, ctx->nnXLen, ctx->nnYLen, requireExactNNLen, ctx->transformerNHWC, logger);
     const string& onnxBytes = onnxResult.serializedModel;
 
-    session = createSession(logger, onnxBytes, serverThreadIdx);
+    // The HTP requires fully static shapes. Build one compiled context per static-batch bucket; each is
+    // a separate weight-carrying HTP context (memory scales with the number of buckets). getOutput
+    // dispatches each eval to the smallest bucket that fits; partial batches are padded up to that
+    // bucket's N by duplicating the last valid row (never an all-zero mask, which would divide by zero
+    // in gpool/RMSNorm).
+    vector<int> bucketSizes = computeBucketSizes(maxBatchSize, ctx->batchBucketsSpec);
+    string bucketList;
+    for(int n: bucketSizes) {
+      Bucket bucket;
+      bucket.n = n;
+      bucket.session = createSession(logger, onnxBytes, n, serverThreadIdx);
+      buckets.push_back(std::move(bucket));
+      bucketList += (bucketList.empty() ? "" : ",") + Global::intToString(n);
+    }
 
     if(logger != NULL)
       logger->write(
         "QNN backend thread " + Global::intToString(serverThreadIdx) + ": ready (device " +
-        (deviceIsHtp(qnnDevice) ? string("HTP") : string("CPU-reference")) + ", staticBatch " +
-        Global::intToString(staticBatch) + ", useFP16 " + Global::boolToString(usingFP16) + ")");
+        (deviceIsHtp(qnnDevice) ? string("HTP") : string("CPU-reference")) + ", batch buckets {" +
+        bucketList + "}, useFP16 " + Global::boolToString(usingFP16) + ")");
 
-    runWarmup(logger, serverThreadIdx);
+    for(const Bucket& bucket: buckets)
+      runWarmup(logger, bucket, serverThreadIdx);
   }
 
   ComputeHandle() = delete;
@@ -286,7 +332,7 @@ struct ComputeHandle {
   // EPContext model (forCompile=false) the shapes are already static and the graph is precompiled, so
   // we must NOT re-apply a free-dim override or re-optimize -- doing so makes ORT re-partition and hunt
   // for a (nonexistent) external context binary. Either way, for the HTP device we append the QNN EP.
-  void configureSessionOptions(Ort::SessionOptions& so, bool forCompile) const {
+  void configureSessionOptions(Ort::SessionOptions& so, bool forCompile, int staticN) const {
     so.SetIntraOpNumThreads(1);
     so.SetGraphOptimizationLevel(
       forCompile ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_DISABLE_ALL);
@@ -295,7 +341,7 @@ struct ComputeHandle {
     // session creation. Runtime padding cannot substitute for this: a dynamic-batch session will not
     // compile onto the HTP. Only needed when compiling from the raw ONNX; the cached model is static.
     if(forCompile)
-      so.AddFreeDimensionOverrideByName("batch", (int64_t)staticBatch);
+      so.AddFreeDimensionOverrideByName("batch", (int64_t)staticN);
 
     if(deviceIsHtp(qnnDevice)) {
       unordered_map<string, string> qnnOptions;
@@ -310,10 +356,11 @@ struct ComputeHandle {
     // Device 100 appends no EP: the default ORT CPU EP runs the graph as an FP32 reference.
   }
 
-  // Build the ORT session, using the on-disk EPContext cache when enabled. Compiling an ONNX graph for
-  // the HTP is slow, so ORT's EPContext feature is used to persist the compiled context as a generated
-  // ONNX wrapper model, keyed on the static-ONNX SHA + the parameters that affect compilation.
-  unique_ptr<Ort::Session> createSession(Logger* logger, const string& onnxBytes, int serverThreadIdx) {
+  // Build the ORT session for a given static batch N, using the on-disk EPContext cache when enabled.
+  // Compiling an ONNX graph for the HTP is slow, so ORT's EPContext feature persists the compiled
+  // context as a generated ONNX wrapper model, keyed on the static-ONNX SHA + the parameters (incl. N)
+  // that affect compilation, so each bucket caches in its own subdirectory.
+  unique_ptr<Ort::Session> createSession(Logger* logger, const string& onnxBytes, int staticN, int serverThreadIdx) {
     const bool cacheEnabled = ctx->useContextCache && deviceIsHtp(qnnDevice);
 
     // The EPContext cache lives in a per-key SUBDIRECTORY: qnncache/qnnctx_<hash>/model_ctx.onnx. Using
@@ -323,7 +370,7 @@ struct ComputeHandle {
     if(cacheEnabled) {
       const string paramStr = Global::strprintf(
         "nnx%d_nny%d_N%d_exact%d_fp16%d_nhwc%d_dev%d_htp%s_perf%s_ort%s",
-        ctx->nnXLen, ctx->nnYLen, staticBatch, requireExactNNLen ? 1 : 0, usingFP16 ? 1 : 0,
+        ctx->nnXLen, ctx->nnYLen, staticN, requireExactNNLen ? 1 : 0, usingFP16 ? 1 : 0,
         ctx->transformerNHWC ? 1 : 0, qnnDevice, ctx->qnnBackendPath.c_str(),
         ctx->htpPerformanceMode.c_str(), Ort::GetVersionString().c_str());
       const string key = sha256Hex(onnxBytes + "\n" + paramStr);
@@ -346,7 +393,7 @@ struct ComputeHandle {
     if(!keyModel.empty() && FileUtils::exists(keyModel)) {
       try {
         Ort::SessionOptions so;
-        configureSessionOptions(so, /*forCompile=*/false);
+        configureSessionOptions(so, /*forCompile=*/false, staticN);
         std::filesystem::path cachePath(keyModel);
         auto sess = make_unique<Ort::Session>(getOrtEnv(), cachePath.c_str(), so);
         if(logger != NULL)
@@ -366,7 +413,7 @@ struct ComputeHandle {
     // has a real base directory for the generated EPContext model + its context binary; then we publish
     // the build directory into the keyed cache with an atomic rename.
     Ort::SessionOptions so;
-    configureSessionOptions(so, /*forCompile=*/true);
+    configureSessionOptions(so, /*forCompile=*/true, staticN);
 
     string buildDir, srcModelPath, ctxModelPath;
     if(!keyDir.empty()) {
@@ -442,21 +489,21 @@ struct ComputeHandle {
     return sess;
   }
 
-  // One dummy eval so the one-time HTP finalization/first-run cost is paid at handle creation rather
-  // than on the first real search move. Uses an all-ones mask (never an all-zero mask, which would
-  // divide by zero in the emitter's gpool/RMSNorm). Non-fatal on failure.
-  void runWarmup(Logger* logger, int serverThreadIdx) {
+  // One dummy eval per bucket so the one-time HTP finalization/first-run cost is paid at handle
+  // creation rather than on the first real search move. Uses an all-ones mask (never an all-zero mask,
+  // which would divide by zero in the emitter's gpool/RMSNorm). Non-fatal on failure.
+  void runWarmup(Logger* logger, const Bucket& bucket, int serverThreadIdx) {
     try {
-      vector<float> mask((size_t)staticBatch * singleMaskElts, 1.0f);
-      vector<float> spatial((size_t)staticBatch * singleSpatialElts, 0.0f);
-      vector<float> global((size_t)staticBatch * singleGlobalElts, 0.0f);
+      vector<float> mask((size_t)bucket.n * singleMaskElts, 1.0f);
+      vector<float> spatial((size_t)bucket.n * singleSpatialElts, 0.0f);
+      vector<float> global((size_t)bucket.n * singleGlobalElts, 0.0f);
       // Mark on-board via spatial channel 0 so the derived mask semantics are consistent.
-      for(int n = 0; n < staticBatch; n++) {
+      for(int n = 0; n < bucket.n; n++) {
         float* s0 = &spatial[(size_t)n * singleSpatialElts];
         for(size_t i = 0; i < singleMaskElts; i++)
           s0[i] = 1.0f;
       }
-      runSession(mask.data(), spatial.data(), global.data(), nullptr, nullptr, nullptr, nullptr, nullptr);
+      runSession(bucket, mask.data(), spatial.data(), global.data(), nullptr, nullptr, nullptr, nullptr, nullptr);
     } catch(const exception& e) {
       if(logger != NULL)
         logger->write(
@@ -464,10 +511,11 @@ struct ComputeHandle {
     }
   }
 
-  // Run the session over the full static batch. Inputs point at staticBatch-sized staging arrays. Each
-  // non-null output pointer receives the first (batch) rows of that output; passing null skips copying
-  // that output (used by warmup). Output copy count is governed by copyRows.
+  // Run one bucket's session over its full static batch (bucket.n rows). Inputs point at staging arrays
+  // holding at least bucket.n rows. Each non-null output pointer receives the first copyRows rows of
+  // that output; passing null skips copying that output (used by warmup).
   void runSession(
+    const Bucket& bucket,
     const float* maskData,
     const float* spatialData,
     const float* globalData,
@@ -477,7 +525,7 @@ struct ComputeHandle {
     float* scoreValueOut,
     float* ownershipOut,
     int copyRows = 0) {
-    const int64_t N = staticBatch;
+    const int64_t N = bucket.n;
     const int64_t H = ctx->nnYLen;
     const int64_t W = ctx->nnXLen;
 
@@ -494,7 +542,7 @@ struct ComputeHandle {
         memInfo, const_cast<float*>(globalData), (size_t)N * singleGlobalElts, globalShape, 4)};
 
     vector<Ort::Value> results =
-      session->Run(Ort::RunOptions{nullptr}, INPUT_NAMES, inputs, 3, OUTPUT_NAMES, 5);
+      bucket.session->Run(Ort::RunOptions{nullptr}, INPUT_NAMES, inputs, 3, OUTPUT_NAMES, 5);
 
     if(copyRows <= 0)
       return;
@@ -510,6 +558,16 @@ struct ComputeHandle {
     copyOut(results[2], valueOut, (size_t)numValueChannels);
     copyOut(results[3], scoreValueOut, (size_t)numScoreValueChannels);
     copyOut(results[4], ownershipOut, (size_t)numOwnershipChannels * singleMaskElts);
+  }
+
+  // Pick the smallest bucket whose static N is >= batchSize. Buckets are sorted ascending and the
+  // largest is maxBatchSize >= batchSize, so a fit always exists.
+  const Bucket& pickBucket(int batchSize) const {
+    for(const Bucket& bucket: buckets) {
+      if(bucket.n >= batchSize)
+        return bucket;
+    }
+    return buckets.back();
   }
 };
 
@@ -661,10 +719,11 @@ void NeuralNet::getOutput(
     std::copy(rowSpatialInput, rowSpatialInput + inputBuffers->singleMaskElts, rowMaskInput);
   }
 
-  // The HTP session has a fixed batch N == staticBatch. If we have fewer real rows, pad up to N by
+  // Dispatch to the smallest bucket whose static N covers this batch, then pad up to that N by
   // duplicating the last valid row. Never pad with an all-zero mask: the emitter divides by the mask
   // sum in gpool/RMSNorm, so a zero mask would produce NaNs. Duplicated rows' outputs are discarded.
-  const int staticBatch = gpuHandle->staticBatch;
+  const ComputeHandle::Bucket& bucket = gpuHandle->pickBucket(batchSize);
+  const int staticBatch = bucket.n;
   assert(batchSize <= staticBatch);
   for(int nIdx = batchSize; nIdx < staticBatch; nIdx++) {
     const int src = batchSize - 1;
@@ -687,6 +746,7 @@ void NeuralNet::getOutput(
 
   // Run the model. We read back the first batchSize rows (padding rows are discarded).
   gpuHandle->runSession(
+    bucket,
     inputBuffers->maskInputs.get(),
     inputBuffers->spatialInputs.get(),
     inputBuffers->globalInputs.get(),
