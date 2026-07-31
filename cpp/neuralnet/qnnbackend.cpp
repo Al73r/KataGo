@@ -120,7 +120,6 @@ struct ComputeContext {
   string contextCacheDirOverride;
   int vtcmMb;                    // optional HTP VTCM size hint (0 => leave to the EP default)
   bool transformerNHWC;          // ONNX emitter layout (default false => NCHW for the HTP)
-  int staticBatchOverride;       // 0 => default (== 1); else a fixed HTP batch N in [1, maxBatchSize]
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -150,7 +149,6 @@ ComputeContext* NeuralNet::createComputeContext(
   context->vtcmMb = cfg.contains("qnnVtcmMb") ? cfg.getInt("qnnVtcmMb", 0, 1024) : 0;
   // The HTP's ONNX contract is NCHW. Keep this false unless someone deliberately benchmarks NHWC.
   context->transformerNHWC = cfg.contains("qnnTransformerNHWC") ? cfg.getBool("qnnTransformerNHWC") : false;
-  context->staticBatchOverride = cfg.contains("qnnStaticBatchSize") ? cfg.getInt("qnnStaticBatchSize", 1, 4096) : 0;
   return context;
 }
 
@@ -249,15 +247,11 @@ struct ComputeHandle {
     usingFP16 = resolveUseFP16(ctx->useFP16Mode, qnnDevice);
 
     // Static batch: the HTP requires fully static shapes, so the session is specialized to a concrete
-    // N. Default to N=1 (the design's Phase-1 target): lowest latency, no padding hazards, and it
-    // compiles reliably. Larger N is supported (partial batches are padded by duplicating the last
-    // valid row) via qnnStaticBatchSize, but big N can exceed HTP graph/VTCM limits on some
-    // ORT/QNN/HTP combinations, so it is opt-in. The override is clamped to [1, maxBatchSize].
-    staticBatch = (ctx->staticBatchOverride > 0) ? ctx->staticBatchOverride : 1;
-    if(staticBatch < 1)
-      staticBatch = 1;
-    if(staticBatch > maxBatchSize)
-      staticBatch = maxBatchSize;
+    // N. We use N = maxBatchSize so that any batch the NN server sends (numBatchEltsFilled in
+    // [1, maxBatchSize]) fits; partial batches are padded up to N by duplicating the last valid row
+    // (never an all-zero mask, which would divide by zero in gpool/RMSNorm). This is the design's
+    // Phase-2 batching. maxBatchSize comes from nnMaxBatchSize via the framework.
+    staticBatch = maxBatchSize < 1 ? 1 : maxBatchSize;
 
     singleMaskElts = (size_t)ctx->nnXLen * ctx->nnYLen;
     singleSpatialElts = (size_t)numSpatialFeatures * ctx->nnXLen * ctx->nnYLen;
