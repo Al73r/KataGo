@@ -128,6 +128,7 @@ struct ComputeContext {
   bool useContextCache;          // persist the compiled EPContext model (default true)
   string contextCacheDirOverride;
   int vtcmMb;                    // optional HTP VTCM size hint (0 => leave to the EP default)
+  int htpFinalizationMode;       // htp_graph_finalization_optimization_mode 0..3 (3 == most aggressive)
   bool transformerNHWC;          // ONNX emitter layout (default false => NCHW for the HTP)
   string batchBucketsSpec;       // qnnBatchBuckets: comma-separated static-N buckets ("" => default)
   bool disableCpuEpFallback;     // qnnDisableCpuEpFallback: make unsupported nodes a hard error (audit)
@@ -159,6 +160,9 @@ ComputeContext* NeuralNet::createComputeContext(
   context->useContextCache = cfg.contains("qnnUseContextCache") ? cfg.getBool("qnnUseContextCache") : true;
   context->contextCacheDirOverride = cfg.contains("qnnContextCacheDir") ? cfg.getString("qnnContextCacheDir") : "";
   context->vtcmMb = cfg.contains("qnnVtcmMb") ? cfg.getInt("qnnVtcmMb", 0, 1024) : 0;
+  // HTP graph finalization optimization mode (0..3). The most aggressive mode (3) can fail to finalize
+  // very large graphs with a generic HTP error; a lower mode sometimes finalizes them. Default 3.
+  context->htpFinalizationMode = cfg.contains("qnnHtpFinalizationMode") ? cfg.getInt("qnnHtpFinalizationMode", 0, 3) : 3;
   // The HTP's ONNX contract is NCHW. Keep this false unless someone deliberately benchmarks NHWC.
   context->transformerNHWC = cfg.contains("qnnTransformerNHWC") ? cfg.getBool("qnnTransformerNHWC") : false;
   // Optional explicit static-batch bucket set (parsed per-handle since it depends on maxBatchSize).
@@ -368,7 +372,7 @@ struct ComputeHandle {
       qnnOptions["backend_path"] = ctx->qnnBackendPath.empty() ? string("QnnHtp.dll") : ctx->qnnBackendPath;
       qnnOptions["htp_performance_mode"] = ctx->htpPerformanceMode;
       qnnOptions["enable_htp_fp16_precision"] = usingFP16 ? "1" : "0";
-      qnnOptions["htp_graph_finalization_optimization_mode"] = "3";
+      qnnOptions["htp_graph_finalization_optimization_mode"] = Global::intToString(ctx->htpFinalizationMode);
       if(ctx->vtcmMb > 0)
         qnnOptions["vtcm_mb"] = Global::intToString(ctx->vtcmMb);
       so.AppendExecutionProvider("QNN", qnnOptions);
