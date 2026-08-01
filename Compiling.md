@@ -117,6 +117,47 @@ As also mentioned in the instructions below but repeated here for visibility, if
    * You will probably want to edit `configs/gtp_example.cfg` (see "Tuning for Performance" above).
    * If using OpenCL, you will want to verify that KataGo is picking up the correct device (e.g. some systems may have both an Intel CPU OpenCL and GPU OpenCL, if KataGo appears to pick the wrong one, you can correct this by specifying `openclGpuToUse` in `configs/gtp_example.cfg`).
 
+## Windows on ARM64 (Snapdragon) — QNN / Hexagon NPU backend
+   * The `QNN` backend runs inference on the Qualcomm **Hexagon NPU (HTP)** via **ONNX Runtime + the QNN Execution Provider**, reusing KataGo's ONNX emitter. It is validated on a **Snapdragon X Elite (X1E80100)** (HTP arch **V73**) running **Windows 11 on ARM64**, in **FP16**. See `docs/NPUBackend.md` for the design.
+   * Scope notes:
+      * Non-metadata models only (the ONNX emitter does not emit SGF-metadata inputs).
+      * **Op support is broad, but the single-context graph has a size ceiling.** Measured on QAIRT 2.48 + X1E80100 (HTP V73): `g170-b15c192` (15×192 convnet) and `b10c384h6nbttflrs` (10-block 384ch **transformer** — attention MatMul/Softmax included) both finalize and run **entirely on the HTP** (no CPU fallback). But `b18c384nbt` (18-block 384ch convnet) and larger (`b28c512nbt`, `b40c768nbt`) **fail HTP graph finalization** with a generic **error 6020** at every finalization mode and in both FP16/FP32 — even at batch `N=1`. The same nets run fine on the CPU EP (`qnnDeviceToUse=100`), so this is a Hexagon finalize-capacity limit, not an op-support or emitter problem. Running the largest nets on the NPU would need graph partitioning across HTP contexts (future work) or a newer QAIRT SDK.
+      * The HTP requires static shapes, so the session is specialized to a fixed batch `N` (default `nnMaxBatchSize`, partial batches padded). FP16 is a measured go/no-go vs. an Eigen reference.
+   * Pinned toolchain (record any change in `configs/gtp_example.cfg`'s cache is keyed on these):
+      * **ONNX Runtime + QNN EP:** `Microsoft.ML.OnnxRuntime.QNN` **1.24.4** (win-arm64). It bundles `onnxruntime.dll`/`.lib`, `onnxruntime_providers_qnn.dll`, and the QNN HTP runtime (`QnnHtp.dll`, `QnnHtpV73Stub.dll`, `libQnnHtpV73Skel.so`, `QnnSystem.dll`, `QnnHtpPrepare.dll`).
+      * **Qualcomm AI Engine Direct (QAIRT) SDK:** 2.48.x (optional — the NuGet already bundles a matching QNN runtime; only needed if you point `qnnBackendPath` at an external `QnnHtp.dll`).
+   * Requirements
+      * **Visual Studio Build Tools 2022** with the **C++ ARM64 build tools** workload (native ARM64 MSVC), plus a Windows 11 SDK. The Build Tools bundle CMake and Ninja under `...\Common7\IDE\CommonExtensions\Microsoft\CMake\`.
+      * **zlib** and **protobuf** for `arm64-windows`, easiest via vcpkg:
+        ```powershell
+        git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+        C:\vcpkg\bootstrap-vcpkg.bat
+        C:\vcpkg\vcpkg.exe install zlib:arm64-windows protobuf:arm64-windows
+        ```
+      * **ONNX Runtime (QNN) ARM64.** Fetch the NuGet and lay it out as an `ONNXRUNTIME_ROOT_DIR` with `include\` + `lib\` (and keep the runtime DLLs for deployment):
+        ```powershell
+        curl.exe -L -o ort.zip https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.qnn/1.24.4/microsoft.ml.onnxruntime.qnn.1.24.4.nupkg
+        Expand-Archive ort.zip -DestinationPath ort-qnn
+        # include\ <- ort-qnn\build\native\include\*
+        # lib\     <- ort-qnn\runtimes\win-arm64\native\onnxruntime.{lib,dll}
+        # bin\     <- ort-qnn\runtimes\win-arm64\native\*.dll, *.so, *.cat  (deploy next to katago.exe)
+        ```
+   * Configure + build from an **ARM64 native** developer shell (so `cl.exe`/CMake target ARM64):
+     ```powershell
+     & $env:ComSpec /c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsarm64.bat" && ^
+       cmake -S cpp -B cpp\build-qnn -G Ninja ^
+         -DCMAKE_BUILD_TYPE=Release ^
+         -DUSE_BACKEND=QNN ^
+         -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+         -DVCPKG_TARGET_TRIPLET=arm64-windows ^
+         -DONNXRUNTIME_ROOT_DIR=C:\deps\onnxruntime-qnn-arm64 && ^
+       cmake --build cpp\build-qnn --config Release'
+     ```
+   * Deploy the ORT + QNN runtime DLLs next to the built `katago.exe` (from the NuGet's `runtimes\win-arm64\native\`: `onnxruntime.dll`, `onnxruntime_providers_qnn.dll`, `onnxruntime_providers_shared.dll`, `QnnHtp.dll`, `QnnHtpV73Stub.dll`, `libQnnHtpV73Skel.so`, `libqnnhtpv73.cat`, `QnnSystem.dll`, `QnnHtpPrepare.dll`). Passing `-DONNXRUNTIME_RUNTIME_DLLS=...` and/or `-DQNN_RUNTIME_DLLS=...` to CMake makes the build copy them automatically as a post-build step.
+   * Configure the backend in `configs/gtp_example.cfg` under the "QNN (Qualcomm Hexagon NPU) settings" block (`qnnDeviceToUse` 0 = HTP / 100 = CPU reference, `qnnUseFP16`, `qnnHtpPerformanceMode`, `qnnUseContextCache`, `qnnBatchBuckets`, ...). The first run per model compiles the HTP context (slow) and caches it (ORT EPContext) under `<homeDataDir>/qnncache`; later runs load the cached context.
+   * Because the HTP needs fixed input shapes, the model is compiled once per static batch size ("bucket", default `1,8,nnMaxBatchSize`) and each eval runs on the smallest bucket that fits. More buckets reduce padding waste on partial batches but each is a separate compiled context holding its own weights, so memory grows with the bucket count (per NN server thread); tune via `qnnBatchBuckets`.
+   * Validate: `katago.exe version` should report "Using QNN (Qualcomm Hexagon NPU) backend"; `katago.exe runnnevalcanarytests -model <net> -config configs/gtp_example.cfg` checks NN numeric correctness (compare against an Eigen build for an FP16 tolerance). `qnnDeviceToUse = 100` runs a plain CPU-EP FP32 reference to isolate wiring vs. NPU-numeric issues.
+
 ## MacOS
    * TLDR (Metal backend - recommended for most users, hybrid CPU+GPU+Neural Engine for maximum throughput):
      ```
